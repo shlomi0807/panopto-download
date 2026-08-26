@@ -25,3 +25,9 @@ Run the following commands in your terminal (Windows):
 pip install playwright requests
 playwright install chromium
 winget install Gyan.FFmpeg
+```
+
+**Clone the repository:**
+   ```bash
+   git clone [https://github.com/shlomi0807/panopto-download.git](https://github.com/shlomi0807/panopto-download.git)
+   cd panopto-download
