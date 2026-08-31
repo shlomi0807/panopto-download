@@ -47,7 +47,7 @@ Usage
 
 """
 
-
+import json
 import re
 import sys
 import time
@@ -66,14 +66,13 @@ except ImportError:
     print("Then: playwright install chromium")
     sys.exit(1)
 
-
 # ----------------------------------------------------------------------
 # Configuration
 # ----------------------------------------------------------------------
 
-NETWORK_WAIT_SECONDS = 300   # max total time to wait for any stream to appear
-QUIET_PERIOD_SECONDS = 4     # stop collecting once no new stream URL for this long
-MAX_COLLECT_SECONDS = 40     # but never collect for longer than this after first hit
+NETWORK_WAIT_SECONDS = 300  # max total time to wait for any stream to appear
+QUIET_PERIOD_SECONDS = 4  # stop collecting once no new stream URL for this long
+MAX_COLLECT_SECONDS = 40  # but never collect for longer than this after first hit
 
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -111,6 +110,34 @@ def get_temp_dir() -> Path:
     d = Path.home() / ".panopto_downloader_temp"
     d.mkdir(parents=True, exist_ok=True)
     return d
+
+
+def get_config_path() -> Path:
+    if sys.platform == "win32":
+        import os
+        base = Path(os.environ.get("LOCALAPPDATA", str(Path.home() / "AppData" / "Local")))
+        d = base / "PanoptoDownloader"
+    else:
+        d = Path.home() / ".panopto_downloader"
+    d.mkdir(parents=True, exist_ok=True)
+    return d / "config.json"
+
+
+def load_config() -> dict:
+    cfg_path = get_config_path()
+    if cfg_path.exists():
+        try:
+            return json.loads(cfg_path.read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+    return {}
+
+
+def save_config(cfg: dict):
+    try:
+        get_config_path().write_text(json.dumps(cfg), encoding="utf-8")
+    except Exception:
+        pass  # not critical if this fails
 
 
 def find_ffmpeg() -> str:
@@ -531,43 +558,16 @@ def download_direct_mp4_stream(urls, session, ffmpeg, temp_dir, final_file: Path
 # Main
 # ----------------------------------------------------------------------
 
-def main():
-    print("=" * 50)
-    print("        PANOPTO LECTURE DOWNLOADER")
-    print("=" * 50)
-
-    page_url = input("\nPaste Panopto lecture URL: ").strip()
-    if not page_url.lower().startswith("http"):
-        print("That doesn't look like a valid URL.")
-        sys.exit(1)
-
-    ffmpeg = find_ffmpeg()
-
-    default_dir = get_desktop_dir()
-    dest_input = input(
-        f"\nWhere should the recordings be saved? (Enter = {default_dir}): "
-    ).strip().strip('"')
-
-    if dest_input:
-        output_dir = Path(dest_input).expanduser()
-    else:
-        output_dir = default_dir
-
-    try:
-        output_dir.mkdir(parents=True, exist_ok=True)
-    except OSError as e:
-        print(f"Could not use that folder ({e}). Falling back to Desktop.")
-        output_dir = default_dir
-        output_dir.mkdir(parents=True, exist_ok=True)
-
-    temp_dir = get_temp_dir()
+def process_lecture(page_url: str, ffmpeg: str, output_dir: Path, temp_dir: Path) -> bool:
+    """Download every video stream found on one Panopto lecture page.
+    Returns True if at least one stream was saved successfully."""
 
     captured, cookies, page_title = capture_streams(page_url)
 
     if not captured["m3u8"] and not captured["mp4"]:
         print("\nNo video stream was detected.")
         print("Make sure the lecture actually started playing, then try again.")
-        sys.exit(1)
+        return False
 
     session = make_session(cookies, referer=page_url)
 
@@ -634,8 +634,63 @@ def main():
             print(f"  - {f.name}  ({size_mb:.2f} MB)")
     if failures:
         print(f"\n{failures} stream(s) failed - see messages above.")
-    if not results:
-        sys.exit(1)
+
+    return bool(results)
+
+
+def ask_yes_no(prompt: str, default_yes: bool = True) -> bool:
+    suffix = " (Y/n): " if default_yes else " (y/N): "
+    answer = input(prompt + suffix).strip().lower()
+    if not answer:
+        return default_yes
+    return answer in ("y", "yes", "כן")
+
+
+def main():
+    print("=" * 50)
+    print("        PANOPTO LECTURE DOWNLOADER")
+    print("=" * 50)
+
+    ffmpeg = find_ffmpeg()
+    temp_dir = get_temp_dir()
+
+    config = load_config()
+    default_dir = Path(config.get("output_dir", str(get_desktop_dir())))
+
+    dest_input = input(
+        f"\nWhere should the recordings be saved? (Enter = {default_dir}): "
+    ).strip().strip('"')
+
+    if dest_input:
+        output_dir = Path(dest_input).expanduser()
+    else:
+        output_dir = default_dir
+
+    try:
+        output_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        print(f"Could not use that folder ({e}). Falling back to Desktop.")
+        output_dir = get_desktop_dir()
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+    config["output_dir"] = str(output_dir)
+    save_config(config)
+    print(f"(This location will be remembered for next time: {output_dir})")
+
+    while True:
+        page_url = input("\nPaste Panopto lecture URL: ").strip()
+        if not page_url.lower().startswith("http"):
+            print("That doesn't look like a valid URL.")
+        else:
+            try:
+                process_lecture(page_url, ffmpeg, output_dir, temp_dir)
+            except Exception as e:
+                print(f"\nSomething went wrong: {e}")
+
+        if not ask_yes_no("\nDownload another lecture?"):
+            break
+
+    print("\nDone. Goodbye!")
 
 
 if __name__ == "__main__":
