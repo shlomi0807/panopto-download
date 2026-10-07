@@ -1,2 +1,6 @@
 .idea/
 .venv/
+dist/
+__pycache__/
+*.spec
+venv/
