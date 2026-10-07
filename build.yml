@@ -1,0 +1,52 @@
+name: Build downloads
+
+on:
+  workflow_dispatch:        # manual "Run workflow" button
+  push:
+    tags:
+      - "v*"                # pushing a tag like v1.0 also publishes a Release
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            artifact: PanoptoDownloader-Windows
+            file: dist/panopto_download.exe
+          - os: macos-latest          # Apple Silicon (M1 and newer)
+            artifact: PanoptoDownloader-macOS
+            file: dist/panopto_download
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install playwright requests imageio-ffmpeg pyinstaller
+
+      - name: Build
+        run: >
+          pyinstaller --onefile
+          --collect-all playwright
+          --collect-all imageio_ffmpeg
+          panopto_download.py
+
+      - name: Upload build
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.file }}
+
+      - name: Publish to Release (tags only)
+        if: startsWith(github.ref, 'refs/tags/v')
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ matrix.file }}

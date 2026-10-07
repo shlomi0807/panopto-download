@@ -1,50 +1,53 @@
 #!/usr/bin/env python3
 """
-Panopto Lecture Downloader (highest available quality)
-========================================================
+Panopto Lecture Downloader (highest available quality, all streams)
+=====================================================================
 
 What this does
 ---------------
 You paste the URL of a Panopto "Viewer.aspx" lecture page that YOU are
 already authorized to view with your own university account. The script:
 
-  1. Opens a real Chrome/Chromium window (via Playwright) using a persistent
+  1. Opens a real Chromium window (via Playwright) using a persistent
      profile, so you only have to log in once.
   2. Waits for you to log in (if needed) and press Play on the lecture.
-  3. Watches the network traffic for the HLS master playlist (master.m3u8)
-     or, for Zoom-uploaded recordings, a direct CloudFront MP4 URL.
-  4. Automatically picks the highest-resolution HLS variant (e.g. 1080p).
+  3. Watches network traffic for every HLS master playlist (master.m3u8)
+     and/or direct CloudFront MP4 URL. Panopto sessions often contain
+     MORE THAN ONE video stream (e.g. a primary camera feed and a
+     separate screen-share feed) - this script detects and downloads
+     ALL of them, not just the first one it sees.
+  4. For each stream, automatically picks the highest-resolution HLS
+     variant (e.g. 1080p).
   5. Downloads every byte-range segment of the underlying fragmented.mp4
-     (this is required because Panopto serves one big MP4 file sliced via
-     HTTP Range requests, not separate .ts segment files).
-  6. Remuxes everything into a clean, seekable MP4 with ffmpeg.
-  7. Saves the result to your Desktop.
+     for each stream (Panopto serves one big MP4 file sliced via HTTP
+     Range requests, not separate .ts segment files).
+  6. Remuxes each stream into a clean, seekable MP4 with ffmpeg.
+  7. Saves everything into a folder named after the lecture, on your
+     Desktop, with one file per stream.
 
 This does NOT bypass DRM or any access control. It simply automates
 grabbing the exact same authenticated stream URLs your browser already
-requests when you watch the lecture, and reassembles them into one file
+requests when you watch the lecture, and reassembles them into files
 for offline viewing.
 
-Requirements (בשימוש הראשון: חובה להתקין את כל הספריות. לאחר ההורדה, סגור ופתח מחדש את החלון)
+Requirements
 ------------
     pip install playwright requests
-    playwright install chromium
-    winget install Gyan.FFmpeg
+
+Google Chrome (or Microsoft Edge) must be installed - no separate browser
+download is needed. ffmpeg must be installed and available on PATH (or
+set FFMPEG_PATH below).
+
+Build a standalone app (keep the console window - the script is interactive):
+    pip install pyinstaller imageio-ffmpeg
+    pyinstaller --onefile --collect-all playwright --collect-all imageio_ffmpeg panopto_download.py
+(See .github/workflows/build.yml to build Windows + macOS automatically.)
 
 Usage
 -----
-    הרץ את הסקריפט בכל דרך שתבחר
+    python panopto_download.py
 
-    לאחר מכן הדבק את הכתובת של השיעור שאתה רוצה להוריד
-
-    אחר כך הדבק את המיקום בו תרצה לשמור את ההורדות (לחץ ENTER כדי לשמור בשולחן עבודה )
-
-    בחלון שייפתח בחר moodle 4.5
-
-    התחבר עם שם משתמש וסיסמה של המודל
-
-    ההורדה תתחיל אוטומטית
-
+Then paste the Panopto lecture page URL when prompted.
 """
 
 import json
@@ -66,13 +69,14 @@ except ImportError:
     print("Then: playwright install chromium")
     sys.exit(1)
 
+
 # ----------------------------------------------------------------------
 # Configuration
 # ----------------------------------------------------------------------
 
-NETWORK_WAIT_SECONDS = 300  # max total time to wait for any stream to appear
-QUIET_PERIOD_SECONDS = 4  # stop collecting once no new stream URL for this long
-MAX_COLLECT_SECONDS = 40  # but never collect for longer than this after first hit
+NETWORK_WAIT_SECONDS = 300   # max total time to wait for any stream to appear
+QUIET_PERIOD_SECONDS = 4     # stop collecting once no new stream URL for this long
+MAX_COLLECT_SECONDS = 40     # but never collect for longer than this after first hit
 
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -147,15 +151,28 @@ def find_ffmpeg() -> str:
         print(f"FFMPEG_PATH is set to '{FFMPEG_PATH}' but that file does not exist.")
         sys.exit(1)
 
+    # 1) An ffmpeg the user already has installed
     ffmpeg = shutil.which("ffmpeg")
-    if not ffmpeg:
-        print("ffmpeg was not found on PATH.")
-        print()
-        print("Install it (e.g. `winget install ffmpeg` on Windows), open a")
-        print("fresh terminal, and try again. Or set FFMPEG_PATH near the")
-        print("top of this script to the full path of ffmpeg.exe.")
-        sys.exit(1)
-    return ffmpeg
+    if ffmpeg:
+        return ffmpeg
+
+    # 2) The ffmpeg binary bundled with the imageio-ffmpeg package
+    #    (this is what makes the packaged .exe / app self-contained)
+    try:
+        import imageio_ffmpeg
+        bundled = imageio_ffmpeg.get_ffmpeg_exe()
+        if bundled and Path(bundled).exists():
+            return bundled
+    except Exception:
+        pass
+
+    print("ffmpeg was not found.")
+    print()
+    print("Install it (e.g. `winget install ffmpeg` on Windows, or")
+    print("`brew install ffmpeg` on macOS), open a fresh terminal, and try")
+    print("again. Or `pip install imageio-ffmpeg`, or set FFMPEG_PATH near")
+    print("the top of this script to the full path of ffmpeg.")
+    sys.exit(1)
 
 
 def sanitize_filename(name: str) -> str:
@@ -181,6 +198,36 @@ def unique_path(path: Path) -> Path:
 # Step 1: Open the browser, capture ALL stream URLs
 # ----------------------------------------------------------------------
 
+def launch_browser(p, profile_dir: Path):
+    """Launch a persistent browser context. Prefers the user's installed
+    Google Chrome, then Microsoft Edge (always present on Windows 10/11),
+    and finally Playwright's bundled Chromium if it happens to be installed.
+    This way no separate browser download is needed."""
+    options = dict(
+        user_data_dir=str(profile_dir),
+        headless=False,
+        viewport={"width": 1400, "height": 900},
+        user_agent=USER_AGENT,
+    )
+
+    attempts = [("chrome", "Google Chrome"), ("msedge", "Microsoft Edge"), (None, "Chromium")]
+    last_error = None
+    for channel, label in attempts:
+        try:
+            print(f"\nOpening {label}...")
+            if channel:
+                return p.chromium.launch_persistent_context(channel=channel, **options)
+            return p.chromium.launch_persistent_context(**options)
+        except Exception as e:
+            last_error = e
+            print(f"  {label} could not be launched, trying next option...")
+
+    print("\nNo supported browser could be launched.")
+    print("Please install Google Chrome and try again.")
+    print(f"(Last error: {last_error})")
+    sys.exit(1)
+
+
 def capture_streams(page_url: str):
     """Open Chromium, navigate to the Panopto page, and capture every
     HLS master playlist / variant playlist and direct CloudFront MP4
@@ -190,13 +237,7 @@ def capture_streams(page_url: str):
     captured = {"m3u8": [], "mp4": []}
 
     with sync_playwright() as p:
-        print("\nOpening Chrome (Chromium)...")
-        context = p.chromium.launch_persistent_context(
-            user_data_dir=str(profile_dir),
-            headless=False,
-            viewport={"width": 1400, "height": 900},
-            user_agent=USER_AGENT,
-        )
+        context = launch_browser(p, profile_dir)
         page = context.pages[0] if context.pages else context.new_page()
 
         def on_request(request):
